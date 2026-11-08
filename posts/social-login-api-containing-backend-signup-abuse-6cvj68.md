@@ -1,0 +1,106 @@
+# Social Login API: Containing Backend Signup Abuse in Property Portals
+
+Blocking automated registrations can also block residents sharing a building's network. TL;DR: a backend social login API needs application-owned abuse controls alongside email-and-password signup and sign-in. Treat social identity as another authentication input, and make every consequential queued action safe to retry. For a property portal, successful authentication must never grant access to a tenancy by itself.
+
+Consider a hypothetical production review: a resident submits registration twice after a slow response, while an automated client submits many registrations from the same network. Both produce repeated requests. The first needs a recoverable path; the second needs containment. A verification-email queue adds another boundary because accepting a request and delivering its message happen at different times. This is a failure analysis scenario, not a report of an observed incident.
+
+The invariant is small: repeated work must not create additional authority.
+
+## How should a backend social login API authorize residents?
+
+The search for Google and GitHub social login in a backend-only Node.js application without NextAuth starts with a reasonable implementation question. The operational question comes first: what can an authenticated account do? The absence of a particular framework doesn't answer that. A backend still needs a trustworthy authentication result, its own session handling, and an authorization decision for the requested resource. OWASP's authentication and authorization guidance separates those responsibilities.
+
+For the concrete system here, residents can register and sign in with email and password. A proposed social sign-in path is an additional entry point, not a replacement for that requirement. In this illustrative data model, account resident-104 has a pending invitation for tenancy unit-18. Those identifiers are examples. A matching email address or a newly authenticated session does not, on its own, establish permission to inspect the tenancy's records. The application must validate the relationship through its chosen enrollment process.
+
+Keep identity establishment separate from tenancy enrollment. This makes an abuse response easier to reason about: restricting suspicious registrations need not invalidate every established resident's session, and completing authentication need not consume a tenancy invitation. The boundary also limits the consequence of a mistaken account association.
+
+No tenancy, no access.
+
+## Follow the duplicate through the queue
+
+A useful failure exercise begins with a registration request whose outcome the browser never receives. The resident tries again. If registration, verification-message scheduling, and enrollment each interpret that retry as fresh intent, one ambiguous response can become 3 durable effects. A network retry is ordinary behavior; the design must define what it means at each boundary.
+
+Use a durable identity constraint for account creation, and define how an existing pending registration behaves. Keep public responses consistent enough to avoid revealing whether an email address has an account. OWASP recommends generic authentication responses and warns that different processing times can still reveal information. A generic sentence is insufficient if status codes, response shapes, or timing expose the distinction.
+
+Message scheduling needs a separate decision.
+
+A retry of the same registration operation should not silently become permission to send another verification email. An explicit resend request is different intent and needs its own abuse budget. Otherwise, the queue becomes a way to turn cheap inbound requests into repeated outbound messages. The intended recipient bears the nuisance even when no account is compromised.
+
+For this design, record the account transition and its pending message together in a transaction, then let a worker deliver the recorded work. That is a proposed architecture, not a claim that a queue provides a particular delivery guarantee. The worker must assume that it can see the same work again. A crash after an external side effect but before recording completion is the awkward boundary: a database uniqueness constraint alone cannot reverse an email already accepted for delivery. Name that uncertainty in the runbook. Choose a delivery mechanism with suitable deduplication semantics, or explicitly accept and bound the possibility of duplicate messages. Don't describe an uncoordinated database update and email send as exactly-once delivery.
+
+## Put the invariant before the side effect
+
+The following Go example specifies an application boundary for a verification worker. It deliberately makes the transactional guarantee part of the interface contract. The concrete storage implementation must enforce that guarantee; this snippet isn't a substitute for it. The operation key is generated by the server when it accepts the registration operation and persists across retries.
+
+```go
+package verification
+
+import (
+    "context"
+    "errors"
+)
+
+type Intent struct {
+    OperationKey string
+    AccountID    string
+    Address      string
+}
+
+// Implementations atomically check eligibility and insert a message intent.
+// An existing operation key returns false without inserting another intent.
+// Eligibility must be read from durable account state.
+type Store interface {
+    EnqueueIfEligible(context.Context, Intent) (bool, error)
+}
+
+// Accept receives a server-created intent from durable registration state.
+func Accept(ctx context.Context, store Store, intent Intent) (bool, error) {
+    if intent.OperationKey == "" || intent.AccountID == "" || intent.Address == "" {
+        return false, errors.New("incomplete verification intent")
+    }
+    return store.EnqueueIfEligible(ctx, intent)
+}
+```
+
+Two concurrent calls with the same operation key must converge on one stored message intent. Enforce that in storage, not with an in-memory map in a worker. If a transaction fails, return an error and preserve the same key on retry. A new key for each attempt defeats the contract. Binding the key to the intended account and message prevents accidental reuse from being interpreted as unrelated work.
+
+This protects scheduling. It doesn't prove delivery.
+
+The sender still needs to handle acknowledgement ambiguity, retry eligibility, and expiry. In particular, a worker recovering an old message should recheck whether sending it is still appropriate. A resident who already completed verification should not receive an obsolete prompt just because a backlog finally drained.
+
+An idempotency key is also not an abuse control.
+
+An attacker can submit distinct operations. Apply admission controls before accepting work, and enforce resend controls against durable account state. The two mechanisms solve different failure cases.
+
+## Choose friction by the harm it prevents
+
+OWASP describes login throttling, account lockout, and CAPTCHA as defenses with different limitations. A property portal needs that distinction. A strict network-wide cap can affect unrelated residents behind shared connectivity. An account-wide lockout can become a denial-of-service tool against a known resident. A challenge introduces friction and should not be treated as the sole defense against automation.
+
+Use layered signals and progressive responses, with thresholds selected from the application's actual traffic and recovery requirements. There is no measured traffic distribution here that would justify a universal requests-per-minute number. Separate password guessing from registration floods and verification resends: they target different resources, and one shared counter can conceal which control is doing the work. Successful authentication should not erase every abuse signal associated with subsequent activity.
+
+The practical comparison is between where the team carries responsibility. Handling social authentication directly puts protocol validation and lifecycle maintenance with the backend team. An authentication component can move some implementation work behind an interface, while the application still owns tenancy authorization, queue behavior, and abuse policy. Evaluate either approach against those obligations. A shorter callback handler is a weak proxy for the size of the operational problem.
+
+Keep the baseline password path defensible too. Follow OWASP guidance for password handling, generic failure responses, secure transport, and recovery. Adding another sign-in method leaves those existing responsibilities in place.
+
+## Rehearse recovery before changing admission policy
+
+Test the boundaries that could enlarge an incident. Submit the same registration concurrently; interrupt processing between persistence and response; replay a recorded message intent; retry after a resident completes verification. The expected outcomes should be explicit: one account transition, no extra authority, and a documented treatment of ambiguous delivery. Also test that a logged-in account without a valid tenancy relationship cannot read that tenancy's records.
+
+Observe admission decisions and queue behavior together. Useful measurements include accepted registrations, throttled attempts by operation type, pending-message age, resend decisions, and duplicate-intent conflicts. Keep passwords, verification secrets, and session credentials out of logs. Prefer correlation identifiers that let an operator trace an operation without turning routine telemetry into a collection of authentication material.
+
+Deploy a policy change gradually and watch legitimate completion alongside rejected traffic. A falling request count alone doesn't establish that abuse fell. It may mean residents cannot finish signing in. A rollback should restore the previous admission policy while retaining uniqueness constraints and authorization checks; weakening those invariants would create a second incident during recovery.
+
+This approach has limits. A portal using only email and password has no reason to add a social callback merely to follow this design. A synchronous operation with no external side effect may need only a transactional state change. Conversely, duplicate suppression cannot stop a distributed attacker creating distinct requests, and a queue cannot validate a resident's entitlement to a home.
+
+The decision rule is to contain each source of harm at its own boundary: throttle abusive attempts, make accepted operations repeatable, and check tenancy authorization when serving protected resources. That gives operators a recovery path without turning authentication success into unearned access.
+
+## References
+
+The sources below support the authentication, authorization, logging, and abuse-control guidance. The transaction and worker contracts above are proposed application design choices.
+
+## Sources
+
+- OWASP Authentication Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html
+- OWASP Authorization Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html
+- OWASP Credential Stuffing Prevention Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Credential_Stuffing_Prevention_Cheat_Sheet.html
+- OWASP Logging Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html
